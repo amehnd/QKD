@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+
+<title>QKD Simulator Map</title>
+
+<style>
+
+html,body{
+
+height:100%;
+
+margin:0;
+
+font-family:Arial;
+
+}
+
+#toolbar{
+
+height:70px;
+
+background:#f4f4f4;
+
+padding:10px;
+
+display:flex;
+
+align-items:center;
+
+gap:10px;
+
+}
+
+button{
+
+padding:10px 18px;
+
+font-size:15px;
+
+cursor:pointer;
+
+}
+
+#info{
+
+margin-left:20px;
+
+font-size:15px;
+
+}
+
+#map{
+
+width:100%;
+
+height:calc(100% - 70px);
+
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div id="toolbar">
+
+<button onclick="mode='tx'">
+
+Select TX
+
+</button>
+
+<button onclick="mode='rx'">
+
+Select RX
+
+</button>
+
+<button onclick="sendCoordinates()">
+
+Send Coordinates
+
+</button>
+
+<div id="info">
+
+TX : -
+
+<br>
+
+RX : -
+
+<br>
+
+Azimuth : -
+
+</div>
+
+</div>
+
+<div id="map"></div>
+
+<script>
+
+let map;
+
+let mode="tx";
+
+let txMarker=null;
+
+let rxMarker=null;
+
+let tx=null;
+
+let rx=null;
+
+let linkLine=null;
+function initMap(){
+
+map=new google.maps.Map(
+
+document.getElementById("map"),
+
+{
+
+center:{lat:20.5937,lng:78.9629},
+
+zoom:5,
+
+mapTypeId:"roadmap"
+
+}
+
+);
+
+map.addListener(
+
+"click",
+
+function(event){
+
+if(mode==="tx"){
+
+if(txMarker){
+
+txMarker.setMap(null);
+
+}
+
+txMarker=new google.maps.Marker({
+
+position:event.latLng,
+
+map:map,
+
+label:"T"
+
+});
+
+tx={
+
+lat:event.latLng.lat(),
+
+lng:event.latLng.lng()
+
+};
+
+}
+
+else{
+
+if(rxMarker){
+
+rxMarker.setMap(null);
+
+}
+
+rxMarker=new google.maps.Marker({
+
+position:event.latLng,
+
+map:map,
+
+label:"R"
+
+});
+
+rx={
+
+lat:event.latLng.lat(),
+
+lng:event.latLng.lng()
+
+};
+
+}
+
+if(tx && rx){
+
+    updateLine();
+
+}
+else{
+
+    document.getElementById("info").innerHTML =
+        "TX : " + (tx ? tx.lat.toFixed(6)+", "+tx.lng.toFixed(6) : "-")
+        + "<br>"
+        + "RX : " + (rx ? rx.lat.toFixed(6)+", "+rx.lng.toFixed(6) : "-");
+
+}
+
+}
+
+);
+
+}
+
+function calculateBearing(lat1, lon1, lat2, lon2){
+
+    const d2r = Math.PI/180;
+    const r2d = 180/Math.PI;
+
+    lat1 *= d2r;
+    lat2 *= d2r;
+
+    const dLon = (lon2-lon1)*d2r;
+
+    const y = Math.sin(dLon)*Math.cos(lat2);
+
+    const x =
+        Math.cos(lat1)*Math.sin(lat2) -
+        Math.sin(lat1)*Math.cos(lat2)*Math.cos(dLon);
+
+    let bearing = Math.atan2(y,x)*r2d;
+
+    return (bearing+360)%360;
+}
+
+function updateLine(){
+
+    if(!(tx && rx))
+        return;
+
+    if(linkLine)
+        linkLine.setMap(null);
+
+    linkLine = new google.maps.Polyline({
+
+        path:[
+            {lat:tx.lat,lng:tx.lng},
+            {lat:rx.lat,lng:rx.lng}
+        ],
+
+        geodesic:true,
+
+        strokeColor:"#0066FF",
+
+        strokeOpacity:1,
+
+        strokeWeight:4,
+
+        map:map
+
+    });
+
+    let az = calculateBearing(
+        tx.lat,
+        tx.lng,
+        rx.lat,
+        rx.lng
+    );
+
+    document.getElementById("info").innerHTML =
+        "TX : " + tx.lat.toFixed(6) + ", " + tx.lng.toFixed(6)
+        + "<br>"
+        + "RX : " + rx.lat.toFixed(6) + ", " + rx.lng.toFixed(6)
+        + "<br>"
+        + "Azimuth : " + az.toFixed(2) + "°";
+}
+
+function sendCoordinates(){
+
+    if(!tx || !rx){
+
+        alert("Please select both TX and RX");
+
+        return;
+
+    }
+
+    fetch("/save", {
+
+        method: "POST",
+
+        headers: {
+
+            "Content-Type": "application/json"
+
+        },
+
+        body: JSON.stringify({
+
+            tx_lat: tx.lat,
+
+            tx_lon: tx.lng,
+
+            rx_lat: rx.lat,
+
+            rx_lon: rx.lng
+
+        })
+
+    })
+
+    .then(response => response.json())
+
+    .then(data => {
+
+        alert("Coordinates Saved Successfully");
+
+    })
+
+    .catch(error => {
+
+        alert("Error saving coordinates");
+
+        console.log(error);
+
+    });
+
+}
+
+</script>
+
+<script async defer
+
+src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBhaj3fRNJDFbhUu1rAYnPSfjIGLRs30g8&callback=initMap">
+
+</script>
+
+</body>
+
+</html>

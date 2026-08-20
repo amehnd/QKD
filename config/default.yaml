@@ -1,0 +1,23 @@
+range_km: 10
+
+wavelength_nm: 1550
+
+pulse_rate_mhz: 200.0
+
+tx_aperture_mm: 150
+
+rx_aperture_mm: 600
+
+mean_photons_per_pulse: 0.5
+
+detector_efficiency: 0.85
+
+dark_count_rate: 100
+
+temperature_c: 25
+
+humidity_percent: 80
+
+visibility_km: 10
+
+wind_speed_m_s: 5
