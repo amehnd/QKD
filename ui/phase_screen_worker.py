@@ -14,6 +14,7 @@ from models.phase_screen import (
     render_near_mid_far,
     compute_default_distances,
     estimate_aperture_transmittance,
+    propagate_cumulative,
 )
 
 
@@ -52,6 +53,43 @@ class PhaseScreenWorker(QRunnable):
             aperture_radius_m = beam_waist_m
             eta_far = estimate_aperture_transmittance(images[-1], delta, aperture_radius_m)
 
+            self.signals.finished.emit(slice_id, distances_m, images, eta_far, r0_used)
+        except Exception as exc:
+            self.signals.error.emit(slice_id, str(exc))
+
+
+class CumulativePhaseScreenWorkerSignals(QObject):
+    # slice_id, distances_m, images, eta_far, r0_used_m
+    finished = Signal(int, tuple, list, float, float)
+    error = Signal(int, str)
+
+
+class CumulativePhaseScreenWorker(QRunnable):
+    """Split-step propagation through slices 0 … target on a background thread."""
+
+    def __init__(self, all_slices, target_slice_idx, wavelength_m,
+                 beam_waist_m, total_link_m=None, grid_size=256):
+        super().__init__()
+        self.all_slices = all_slices
+        self.target_slice_idx = target_slice_idx
+        self.wavelength_m = wavelength_m
+        self.beam_waist_m = beam_waist_m
+        self.total_link_m = total_link_m
+        self.grid_size = grid_size
+        self.signals = CumulativePhaseScreenWorkerSignals()
+
+    def run(self):
+        target = self.all_slices[self.target_slice_idx]
+        slice_id = target.slice_id
+        try:
+            distances_m, images, eta_far, r0_used = propagate_cumulative(
+                self.all_slices,
+                self.target_slice_idx,
+                self.wavelength_m,
+                self.beam_waist_m,
+                total_link_m=self.total_link_m,
+                grid_size=self.grid_size,
+            )
             self.signals.finished.emit(slice_id, distances_m, images, eta_far, r0_used)
         except Exception as exc:
             self.signals.error.emit(slice_id, str(exc))

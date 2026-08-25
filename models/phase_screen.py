@@ -154,3 +154,194 @@ def estimate_aperture_transmittance(intensity, delta, aperture_radius_m):
 
     inside = intensity[r2 <= aperture_radius_m ** 2].sum()
     return float(inside / total)
+
+
+# ── Cumulative (split-step) propagation ──────────────────────────────
+
+def propagate_cumulative(
+    all_slices,
+    target_slice_idx,
+    wavelength_m,
+    beam_waist_m,
+    total_link_m=None,
+    grid_size=GRID_SIZE_DEFAULT,
+    base_seed=42,
+):
+    """Split-step beam propagation through slices 0 … target_slice_idx.
+
+    Unlike generate_slice_phase_screen() + render_near_mid_far(), which
+    start from a fresh Gaussian every time, this function carries the
+    complex electric field forward through every preceding slice so the
+    result at slice N includes the accumulated distortions of slices
+    0 … N-1.
+
+    Returns (distances_m, images, eta_far, r0_target) — same shape as
+    the independent pathway so the popup can display them identically.
+    """
+    beam_waist_m = max(float(beam_waist_m), MIN_BEAM_WAIST_M)
+
+    # Use the same grid sizing logic as the independent mode so the two
+    # rows in the popup are visually comparable pixel-for-pixel.
+    target = all_slices[target_slice_idx]
+    if target.Cn2 > 0:
+        r0_target = compute_reference_r0(target.Cn2, wavelength_m)
+    else:
+        r0_target = float(target.fried_parameter_m)
+    r0_target = max(r0_target, MIN_FRIED_PARAMETER_M)
+
+    beam_diam = max(float(target.beam_diameter_m), 4.0 * r0_target, 4.0 * MIN_BEAM_WAIST_M)
+    delta = beam_diam / grid_size
+
+    # Build a Gaussian field on this grid
+    x = (np.arange(grid_size) - grid_size // 2) * delta
+    X, Y = np.meshgrid(x, x)
+    field = np.exp(-(X ** 2 + Y ** 2) / beam_waist_m ** 2).astype(np.complex128)
+
+    # Walk through slices 0 … target_slice_idx
+    for i in range(target_slice_idx + 1):
+        s = all_slices[i]
+
+        # Compute r0 for this slice's phase screen
+        if s.Cn2 > 0:
+            r0_i = compute_reference_r0(s.Cn2, wavelength_m)
+        else:
+            r0_i = float(s.fried_parameter_m)
+        r0_i = max(r0_i, MIN_FRIED_PARAMETER_M)
+
+        # Generate phase screen for this slice
+        screen = ft_sh_phase_screen(
+            r0=r0_i,
+            N=grid_size,
+            delta=delta,
+            L0=DEFAULT_OUTER_SCALE_M,
+            l0=DEFAULT_INNER_SCALE_M,
+            seed=base_seed + int(s.slice_id),
+        )
+
+        # Apply phase screen
+        field = field * np.exp(1j * screen)
+
+        # Free-space propagate across this slice's physical length
+        slice_length = max(float(s.length_m), 1.0)
+        field = angularSpectrum(field, wavelength_m, delta, delta, slice_length)
+
+    # Now render near/mid/far from the accumulated field
+    distances_m = compute_default_distances(total_link_m)
+    images = []
+    for z in distances_m:
+        propagated = angularSpectrum(field, wavelength_m, delta, delta, float(z))
+        images.append(np.abs(propagated) ** 2)
+
+    aperture_radius_m = beam_waist_m
+    eta_far = estimate_aperture_transmittance(images[-1], delta, aperture_radius_m)
+
+    return distances_m, images, eta_far, r0_target
+
+
+def propagate_all_slices(
+    all_slices,
+    wavelength_m,
+    beam_waist_m,
+    grid_size=GRID_SIZE_DEFAULT,
+    base_seed=42,
+    aperture_radius_m=None,
+):
+    """Full split-step propagation, returning a snapshot after every slice.
+
+    This powers the "Beam Evolution" filmstrip viewer: one intensity image
+    per slice, showing progressive cumulative degradation.
+
+    Grid sizing and propagation distances are chosen to match the hover
+    popup's approach so the two views are visually consistent:
+      - Grid is sized from beam_waist_m and r0 (not the last slice's
+        beam_diameter_m, which can be orders of magnitude larger than the
+        beam waist at TX and would make the beam a tiny dot).
+      - Each slice is propagated over REFERENCE_LENGTH_M (100 m) rather
+        than the actual slice length (which can be thousands of metres and
+        causes numerical artefacts with the angular spectrum at this grid
+        resolution). This is the same reference length used to compute
+        the popup's r0 from Cn2.
+
+    Returns a list of dicts, one per slice:
+        {
+            "slice_id":   int,
+            "slice_idx":  int,
+            "intensity":  2D ndarray,
+            "r0":         float  (Fried parameter used for this slice's screen),
+            "cn2":        float,
+            "distance_m": float  (cumulative distance from TX — real geometry),
+            "eta":        float  (aperture transmittance),
+            "delta":      float  (metres/pixel),
+        }
+    """
+    beam_waist_m = max(float(beam_waist_m), MIN_BEAM_WAIST_M)
+    if aperture_radius_m is None:
+        aperture_radius_m = beam_waist_m
+
+    # Compute a representative r0 from the median Cn2 to size the grid.
+    cn2_values = [s.Cn2 for s in all_slices if s.Cn2 > 0]
+    if cn2_values:
+        median_cn2 = sorted(cn2_values)[len(cn2_values) // 2]
+        r0_ref = compute_reference_r0(median_cn2, wavelength_m)
+    else:
+        r0_ref = MIN_FRIED_PARAMETER_M
+    r0_ref = max(r0_ref, MIN_FRIED_PARAMETER_M)
+
+    # Grid sized so the beam fills most of the panel — same logic as the
+    # hover popup's generate_slice_phase_screen().
+    beam_diam = max(4.0 * beam_waist_m, 4.0 * r0_ref, 4.0 * MIN_BEAM_WAIST_M)
+    delta = beam_diam / grid_size
+
+    # Start with a clean Gaussian field
+    x = (np.arange(grid_size) - grid_size // 2) * delta
+    X, Y = np.meshgrid(x, x)
+    field = np.exp(-(X ** 2 + Y ** 2) / beam_waist_m ** 2).astype(np.complex128)
+
+    results = []
+    cumulative_distance = 0.0
+
+    for idx, s in enumerate(all_slices):
+        # Track real cumulative geometry for labels
+        cumulative_distance += max(float(s.length_m), 1.0)
+
+        # Compute r0 for this slice (same as hover popup)
+        if s.Cn2 > 0:
+            r0_i = compute_reference_r0(s.Cn2, wavelength_m)
+        else:
+            r0_i = float(s.fried_parameter_m)
+        r0_i = max(r0_i, MIN_FRIED_PARAMETER_M)
+
+        # Generate and apply phase screen
+        screen = ft_sh_phase_screen(
+            r0=r0_i,
+            N=grid_size,
+            delta=delta,
+            L0=DEFAULT_OUTER_SCALE_M,
+            l0=DEFAULT_INNER_SCALE_M,
+            seed=base_seed + int(s.slice_id),
+        )
+        field = field * np.exp(1j * screen)
+
+        # Propagate a fixed reference distance (matching the hover popup's
+        # r0-from-Cn2 reference length) for numerical stability.
+        field = angularSpectrum(
+            field, wavelength_m, delta, delta, REFERENCE_LENGTH_M
+        )
+
+        # Record snapshot
+        intensity = np.abs(field) ** 2
+        eta = estimate_aperture_transmittance(intensity, delta, aperture_radius_m)
+
+        results.append({
+            "slice_id": int(s.slice_id),
+            "slice_idx": idx,
+            "intensity": intensity,
+            "r0": r0_i,
+            "cn2": float(s.Cn2),
+            "distance_m": cumulative_distance,
+            "eta": eta,
+            "delta": delta,
+        })
+
+    return results
+

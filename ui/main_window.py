@@ -7,7 +7,8 @@ NON-SCROLL SINGLE WINDOW
 from plots.mpl_canvas import MplCanvas
 from plots.plot_manager import PlotManager
 from ui.phase_screen_popup import PhaseScreenPopup
-from ui.phase_screen_worker import PhaseScreenWorker
+from ui.phase_screen_worker import PhaseScreenWorker, CumulativePhaseScreenWorker
+from ui.cumulative_viewer import CumulativeViewer
 from PySide6.QtWidgets import QScrollArea
 from PySide6.QtWidgets import QPlainTextEdit
 from core.logger import logger
@@ -414,11 +415,13 @@ class PropagationWidget(QWidget):
 
         wavelength_m = self.state.wavelength_nm * 1e-9
         total_link_m = self.state.link_distance_km * 1000.0
+
+        # ── Independent worker (existing, bottom row) ──────────────
         worker = PhaseScreenWorker(nearest, wavelength_m, total_link_m=total_link_m)
         # Keep a Python reference until the job completes -- otherwise the
         # QRunnable/its signals QObject can be garbage-collected before
         # QThreadPool runs it, silently dropping the result.
-        self._active_phase_workers[job_id] = worker
+        self._active_phase_workers[(job_id, 'ind')] = worker
         worker.signals.finished.connect(
             lambda slice_id, distances_m, images, eta_far, r0_used, jid=job_id: self._on_phase_screen_ready(
                 jid, slice_id, distances_m, images, eta_far, r0_used
@@ -429,19 +432,65 @@ class PropagationWidget(QWidget):
         )
         self._phase_threadpool.start(worker)
 
+        # ── Cumulative worker (new, top row) ───────────────────────
+        all_slices = self.state.propagation_slices
+        if all_slices:
+            # Find the index of the hovered slice in the list
+            target_idx = None
+            for idx, s in enumerate(all_slices):
+                if s.slice_id == nearest.slice_id:
+                    target_idx = idx
+                    break
+
+            if target_idx is not None:
+                beam_waist_m = nearest.beam_radius_m
+                if beam_waist_m <= 0:
+                    beam_waist_m = max(nearest.beam_diameter_m / 2.0, 0.02)
+
+                cum_worker = CumulativePhaseScreenWorker(
+                    all_slices, target_idx, wavelength_m,
+                    beam_waist_m, total_link_m=total_link_m,
+                )
+                self._active_phase_workers[(job_id, 'cum')] = cum_worker
+                cum_worker.signals.finished.connect(
+                    lambda slice_id, distances_m, images, eta_far, r0_used, jid=job_id, n=target_idx+1:
+                        self._on_cumulative_phase_screen_ready(
+                            jid, slice_id, distances_m, images, eta_far, r0_used, n
+                        )
+                )
+                cum_worker.signals.error.connect(
+                    lambda slice_id, message, jid=job_id:
+                        self._on_cumulative_phase_screen_error(jid, slice_id, message)
+                )
+                self._phase_threadpool.start(cum_worker)
+
     def _on_phase_screen_ready(self, job_id, slice_id, distances_m, images, eta_far, r0_used):
-        self._active_phase_workers.pop(job_id, None)
+        self._active_phase_workers.pop((job_id, 'ind'), None)
         if job_id != self._hover_job_id or slice_id != self._hover_slice_id:
             return
         if self._phase_popup is not None:
             self._phase_popup.show_result(distances_m, images, eta_far, r0_used)
 
     def _on_phase_screen_error(self, job_id, slice_id, message):
-        self._active_phase_workers.pop(job_id, None)
+        self._active_phase_workers.pop((job_id, 'ind'), None)
         if job_id != self._hover_job_id or slice_id != self._hover_slice_id:
             return
         if self._phase_popup is not None:
             self._phase_popup.show_error(message)
+
+    def _on_cumulative_phase_screen_ready(self, job_id, slice_id, distances_m, images, eta_far, r0_used, num_slices):
+        self._active_phase_workers.pop((job_id, 'cum'), None)
+        if job_id != self._hover_job_id or slice_id != self._hover_slice_id:
+            return
+        if self._phase_popup is not None:
+            self._phase_popup.show_cumulative_result(distances_m, images, eta_far, r0_used, num_slices)
+
+    def _on_cumulative_phase_screen_error(self, job_id, slice_id, message):
+        self._active_phase_workers.pop((job_id, 'cum'), None)
+        if job_id != self._hover_job_id or slice_id != self._hover_slice_id:
+            return
+        if self._phase_popup is not None:
+            self._phase_popup.show_cumulative_error(message)
 
     def leaveEvent(self, event):
         self._hover_slice_id = None
@@ -2847,6 +2896,25 @@ color:gray;
 
         self.propagation_widget = PropagationWidget(self.state)
 
+        # "Show Beam Evolution" button bar
+        beam_evo_bar = QHBoxLayout()
+        beam_evo_bar.setContentsMargins(0, 4, 0, 4)
+        beam_evo_bar.addStretch()
+        self.beam_evolution_btn = QPushButton("⚡ Show Beam Evolution (Cumulative)")
+        self.beam_evolution_btn.setStyleSheet(
+            "QPushButton { background:#1a73e8; color:white; font-weight:bold; "
+            "padding:6px 18px; border-radius:4px; font-size:11px; }"
+            "QPushButton:hover { background:#1557b0; }"
+        )
+        self.beam_evolution_btn.setToolTip(
+            "Open a filmstrip view showing how the beam degrades\n"
+            "as it passes through each atmospheric slice cumulatively."
+        )
+        self.beam_evolution_btn.clicked.connect(self._open_beam_evolution_viewer)
+        beam_evo_bar.addWidget(self.beam_evolution_btn)
+        beam_evo_bar.addStretch()
+        propagation_layout.addLayout(beam_evo_bar)
+
         # -----------------------------
         # Slice Information
         # -----------------------------
@@ -3959,6 +4027,17 @@ color:gray;
         time.sleep(2)
 
         print("Done.")
+
+    def _open_beam_evolution_viewer(self):
+        """Open the filmstrip Beam Evolution viewer dialog."""
+        if not self.state.propagation_slices:
+            QMessageBox.information(
+                self, "No Data",
+                "Run a simulation first so there are propagation slices to visualise."
+            )
+            return
+        viewer = CumulativeViewer(self.state, parent=self)
+        viewer.exec()
 
     def open_tx_map(self):
 
