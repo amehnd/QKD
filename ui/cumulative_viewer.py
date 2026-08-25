@@ -32,11 +32,12 @@ class _EvolutionWorkerSignals(QObject):
 
 class _EvolutionWorker(QRunnable):
 
-    def __init__(self, all_slices, wavelength_m, beam_waist_m, grid_size=256):
+    def __init__(self, all_slices, wavelength_m, beam_waist_m, total_link_m, grid_size=256):
         super().__init__()
         self.all_slices = all_slices
         self.wavelength_m = wavelength_m
         self.beam_waist_m = beam_waist_m
+        self.total_link_m = total_link_m
         self.grid_size = grid_size
         self.signals = _EvolutionWorkerSignals()
 
@@ -46,6 +47,7 @@ class _EvolutionWorker(QRunnable):
                 self.all_slices,
                 self.wavelength_m,
                 self.beam_waist_m,
+                self.total_link_m,
                 grid_size=self.grid_size,
             )
             self.signals.finished.emit(results)
@@ -138,7 +140,7 @@ class CumulativeViewer(QDialog):
             f"{n} slices  |  Computing…"
         )
 
-        worker = _EvolutionWorker(slices, wavelength_m, beam_waist_m, grid_size=256)
+        worker = _EvolutionWorker(slices, wavelength_m, beam_waist_m, link_km * 1000.0, grid_size=256)
         self._worker_ref = worker
         worker.signals.finished.connect(self._on_finished)
         worker.signals.error.connect(self._on_error)
