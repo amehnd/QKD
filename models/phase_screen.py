@@ -158,6 +158,36 @@ def estimate_aperture_transmittance(intensity, delta, aperture_radius_m):
 
 # ── Cumulative (split-step) propagation ──────────────────────────────
 
+def _slice_r0(s, wavelength_m):
+    """Fried parameter (m) for one slice, same rule used everywhere else
+    in this module: Cn2-derived if available, else the app's own value."""
+    if s.Cn2 > 0:
+        r0 = compute_reference_r0(s.Cn2, wavelength_m)
+    else:
+        r0 = float(s.fried_parameter_m)
+    return max(r0, MIN_FRIED_PARAMETER_M)
+
+
+def compute_shared_grid_delta(all_slices, wavelength_m, grid_size=GRID_SIZE_DEFAULT):
+    """Grid spacing (metres/pixel), identical for every slice in the walk.
+
+    propagate_cumulative() previously derived `delta` from whichever slice
+    was the *current hover target*, so the same slice's phase screen (same
+    seed, same r0) could come out at a different physical scale depending
+    on which slice the user was hovering -- breaking the Near(N) == Far(N-1)
+    identity the split-step continuity depends on. Sizing the grid to fit
+    the largest beam/r0 combination across ALL slices up front makes delta
+    target-independent, so a given slice's screen is pixel-identical no
+    matter which target_slice_idx it was generated under.
+    """
+    max_beam_diam = 4.0 * MIN_BEAM_WAIST_M
+    for s in all_slices:
+        r0 = _slice_r0(s, wavelength_m)
+        beam_diam = max(float(s.beam_diameter_m), 4.0 * r0, 4.0 * MIN_BEAM_WAIST_M)
+        max_beam_diam = max(max_beam_diam, beam_diam)
+    return max_beam_diam / grid_size
+
+
 def propagate_cumulative(
     all_slices,
     target_slice_idx,
@@ -165,7 +195,8 @@ def propagate_cumulative(
     beam_waist_m,
     total_link_m=None,
     grid_size=GRID_SIZE_DEFAULT,
-    base_seed=42,
+    base_seed=0,
+    launch_beam_waist_m=None,
 ):
     """Split-step beam propagation through slices 0 … target_slice_idx.
 
@@ -175,40 +206,78 @@ def propagate_cumulative(
     result at slice N includes the accumulated distortions of slices
     0 … N-1.
 
+    Near/Mid/Far are real per-slice checkpoints, not fixed offsets, so
+    adjacent slices' popups connect:
+      - Near(N)  = field entering slice N, i.e. exactly Far(N-1) (or the
+                   fresh TX Gaussian for slice 0). Not recomputed — it is
+                   literally the same array produced while walking slice
+                   N-1's own Far checkpoint.
+      - Mid(N)   = after applying slice N's own phase screen, propagate
+                   HALF of slice N's length_m.
+      - Far(N)   = after applying slice N's own phase screen, propagate
+                   the FULL slice N's length_m.
+
+    distances_m is the true absolute cumulative distance from TX for each
+    checkpoint (sum of prior slices' lengths, plus half/full of the
+    current slice's length) -- not the fixed-offset numbers used by the
+    independent pathway.
+
+    Two different beam sizes are involved, and they must NOT be the same
+    value:
+
+      * launch_beam_waist_m: the width the split-step field starts at,
+        BEFORE slice 0's screen is applied. This has to be the same value
+        no matter which target_slice_idx is requested -- otherwise the
+        Near(N) == Far(N-1) identity above is only true *within* one call,
+        not across separate hovers, because "Far(N-1)" computed while
+        hovering slice N-1 and the "slices 0..N-2" reconstructed while
+        hovering slice N would be seeded with two different starting
+        widths (whichever slice happened to be hovered) and so would not
+        actually be the same array. If the caller doesn't pass one, this
+        falls back to all_slices[0]'s own beam radius -- not physically
+        exact (it's the size a little past true z=0, not at the TX
+        aperture itself), but it is at minimum the SAME value on every
+        call, which is what the continuity guarantee depends on.
+
+      * beam_waist_m: the LOCAL size at the target slice, used only to
+        size the receiving aperture for estimate_aperture_transmittance()
+        at the end -- this legitimately does vary slice to slice (a
+        downstream slice's own expected local spot size), unlike the
+        launch size above.
+
     Returns (distances_m, images, eta_far, r0_target) — same shape as
     the independent pathway so the popup can display them identically.
     """
     beam_waist_m = max(float(beam_waist_m), MIN_BEAM_WAIST_M)
 
-    # Use the same grid sizing logic as the independent mode so the two
-    # rows in the popup are visually comparable pixel-for-pixel.
+    if launch_beam_waist_m is None or launch_beam_waist_m <= 0:
+        launch_beam_waist_m = float(getattr(all_slices[0], "beam_radius_m", 0.0))
+    launch_beam_waist_m = max(launch_beam_waist_m, MIN_BEAM_WAIST_M)
+
     target = all_slices[target_slice_idx]
-    if target.Cn2 > 0:
-        r0_target = compute_reference_r0(target.Cn2, wavelength_m)
-    else:
-        r0_target = float(target.fried_parameter_m)
-    r0_target = max(r0_target, MIN_FRIED_PARAMETER_M)
+    r0_target = _slice_r0(target, wavelength_m)
 
-    beam_diam = max(float(target.beam_diameter_m), 4.0 * r0_target, 4.0 * MIN_BEAM_WAIST_M)
-    delta = beam_diam / grid_size
+    # Shared across every slice/target so a slice's screen (same seed) is
+    # pixel-identical regardless of which slice is being hovered.
+    delta = compute_shared_grid_delta(all_slices, wavelength_m, grid_size)
 
-    # Build a Gaussian field on this grid
+    # Build a Gaussian field on this grid -- the fresh TX beam. Uses the
+    # fixed launch size, not the target slice's own (distance-dependent)
+    # beam_waist_m -- see docstring above.
     x = (np.arange(grid_size) - grid_size // 2) * delta
     X, Y = np.meshgrid(x, x)
-    field = np.exp(-(X ** 2 + Y ** 2) / beam_waist_m ** 2).astype(np.complex128)
+    field = np.exp(-(X ** 2 + Y ** 2) / launch_beam_waist_m ** 2).astype(np.complex128)
 
-    # Walk through slices 0 … target_slice_idx
-    for i in range(target_slice_idx + 1):
+    # Walk through slices 0 … target_slice_idx - 1 to build the field
+    # entering the target slice. This is the SAME computation slice N-1
+    # performs to produce its own Far checkpoint, so the result here is
+    # bit-identical to Far(N-1) (given the same launch_beam_waist_m and
+    # base_seed on every call -- see docstring above).
+    near_distance_m = 0.0
+    for i in range(target_slice_idx):
         s = all_slices[i]
+        r0_i = _slice_r0(s, wavelength_m)
 
-        # Compute r0 for this slice's phase screen
-        if s.Cn2 > 0:
-            r0_i = compute_reference_r0(s.Cn2, wavelength_m)
-        else:
-            r0_i = float(s.fried_parameter_m)
-        r0_i = max(r0_i, MIN_FRIED_PARAMETER_M)
-
-        # Generate phase screen for this slice
         screen = ft_sh_phase_screen(
             r0=r0_i,
             N=grid_size,
@@ -217,20 +286,41 @@ def propagate_cumulative(
             l0=DEFAULT_INNER_SCALE_M,
             seed=base_seed + int(s.slice_id),
         )
-
-        # Apply phase screen
         field = field * np.exp(1j * screen)
 
-        # Free-space propagate across this slice's physical length
         slice_length = max(float(s.length_m), 1.0)
         field = angularSpectrum(field, wavelength_m, delta, delta, slice_length)
+        near_distance_m += slice_length
 
-    # Now render near/mid/far from the accumulated field
-    distances_m = compute_default_distances(total_link_m)
-    images = []
-    for z in distances_m:
-        propagated = angularSpectrum(field, wavelength_m, delta, delta, float(z))
-        images.append(np.abs(propagated) ** 2)
+    near_field = field
+
+    # Apply the target slice's own phase screen, then branch to Mid/Far.
+    screen = ft_sh_phase_screen(
+        r0=r0_target,
+        N=grid_size,
+        delta=delta,
+        L0=DEFAULT_OUTER_SCALE_M,
+        l0=DEFAULT_INNER_SCALE_M,
+        seed=base_seed + int(target.slice_id),
+    )
+    field_after_screen = near_field * np.exp(1j * screen)
+
+    target_length = max(float(target.length_m), 1.0)
+    half_length = target_length / 2.0
+
+    mid_field = angularSpectrum(field_after_screen, wavelength_m, delta, delta, half_length)
+    far_field = angularSpectrum(field_after_screen, wavelength_m, delta, delta, target_length)
+
+    distances_m = (
+        near_distance_m,
+        near_distance_m + half_length,
+        near_distance_m + target_length,
+    )
+    images = [
+        np.abs(near_field) ** 2,
+        np.abs(mid_field) ** 2,
+        np.abs(far_field) ** 2,
+    ]
 
     aperture_radius_m = beam_waist_m
     eta_far = estimate_aperture_transmittance(images[-1], delta, aperture_radius_m)
@@ -244,7 +334,7 @@ def propagate_all_slices(
     beam_waist_m,
     total_link_m,
     grid_size=GRID_SIZE_DEFAULT,
-    base_seed=42,
+    base_seed=0,
 ):
     """Full split-step propagation, returning a snapshot after every slice.
 
@@ -268,12 +358,18 @@ def propagate_all_slices(
         }
     """
     results = []
-    cumulative_distance = 0.0
+
+    # Fixed launch size for the WHOLE filmstrip -- every frame is meant to
+    # be the same beam further along, not a fresh restart at each slice's
+    # own already-grown local radius. See propagate_cumulative()'s
+    # docstring for why this must stay constant across the loop.
+    launch_bw = float(getattr(all_slices[0], "beam_radius_m", 0.0))
+    if launch_bw <= 0:
+        launch_bw = beam_waist_m
 
     for idx, s in enumerate(all_slices):
-        cumulative_distance += max(float(s.length_m), 1.0)
-
-        # Match the hover popup's beam waist logic
+        # Local (target-slice) size -- used only for the receiving-aperture
+        # sizing in propagate_cumulative(), not for seeding the field.
         bw = s.beam_radius_m
         if bw <= 0:
             bw = max(s.beam_diameter_m / 2.0, 0.02)
@@ -288,6 +384,7 @@ def propagate_all_slices(
             total_link_m=total_link_m,
             grid_size=grid_size,
             base_seed=base_seed,
+            launch_beam_waist_m=launch_bw,
         )
 
         results.append({
@@ -296,12 +393,9 @@ def propagate_all_slices(
             "intensity": images[0],  # Use the 'Near' image to match popup
             "r0": r0_target,
             "cn2": float(s.Cn2),
-            "distance_m": cumulative_distance,
+            "distance_m": distances_m[0],  # real Near distance, matches intensity image
             "eta": eta_far,
             "delta": 0.0,  # not strictly needed by the viewer anymore
         })
 
     return results
-
-
-
