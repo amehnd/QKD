@@ -8,6 +8,7 @@ from plots.mpl_canvas import MplCanvas
 from plots.plot_manager import PlotManager
 from ui.phase_screen_popup import PhaseScreenPopup
 from ui.phase_screen_worker import PhaseScreenWorker
+from ui.phase_screen_calibration_tab import PhaseScreenCalibrationTab
 from PySide6.QtWidgets import QScrollArea
 from PySide6.QtWidgets import QPlainTextEdit
 from core.logger import logger
@@ -3042,6 +3043,9 @@ color:gray;
         tabs.addTab(slice_tab, "SLICE DETAILS")
         tabs.addTab(propagation_tab, "SCHEMATIC")
 
+        self.phase_screen_calibration_tab = PhaseScreenCalibrationTab(state=self.state)
+        tabs.addTab(self.phase_screen_calibration_tab, "PHASE SCREEN CALIBRATION")
+
         settings_tab = self.create_settings_tab()
 
         tabs.addTab(settings_tab, "SETTINGS")
@@ -4610,6 +4614,10 @@ color:gray;
             self.propagation_widget.state = self.state
             self.propagation_widget.update()
             self.propagation_widget.repaint()
+
+            # Let the calibration tab pick up this run's slices
+            if hasattr(self, "phase_screen_calibration_tab"):
+                self.phase_screen_calibration_tab.refresh_from_state(self.state)
 
             if self.state.solve_for == "TX Height":
                 self.mission["TX height"].blockSignals(True)
